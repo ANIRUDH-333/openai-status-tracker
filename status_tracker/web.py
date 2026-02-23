@@ -4,6 +4,7 @@ import html
 import os
 from collections import deque
 from datetime import datetime
+from string import Template
 
 from aiohttp import web
 
@@ -11,13 +12,7 @@ from status_tracker.models import EventType, StatusEvent
 
 MAX_EVENTS = 100
 
-_EVENT_CSS: dict[EventType, tuple[str, str]] = {
-    EventType.NEW_INCIDENT: ("#fee2e2", "NEW INCIDENT"),
-    EventType.INCIDENT_UPDATED: ("#fef9c3", "UPDATED"),
-    EventType.INCIDENT_RESOLVED: ("#dcfce7", "RESOLVED"),
-}
-
-HTML_TEMPLATE = """\
+HTML_TEMPLATE = Template("""\
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -51,10 +46,10 @@ HTML_TEMPLATE = """\
 </head>
 <body>
 <h1>Status Tracker</h1>
-<p class="subtitle">Monitoring {page_count} page(s) &middot; Last {event_count} events &middot; Auto-refreshes every 30s</p>
-{content}
+<p class="subtitle">Monitoring $page_count page(s) &middot; Last $event_count events &middot; Auto-refreshes every 30s</p>
+$content
 </body>
-</html>"""
+</html>""")
 
 
 class WebHandler:
@@ -76,7 +71,7 @@ class WebHandler:
         else:
             content = "\n".join(self._render_event(e) for e in self._events)
 
-        page = HTML_TEMPLATE.format(
+        page = HTML_TEMPLATE.substitute(
             page_count=self._page_count,
             event_count=len(self._events),
             content=content,
