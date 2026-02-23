@@ -73,13 +73,14 @@ class ConsoleHandler:
         print()
 
 
-async def run_consumer(bus: EventBus, handler: ConsoleHandler) -> None:
-    """Consume events from the bus and pass them to the handler."""
+async def run_consumer(bus: EventBus, *handlers) -> None:
+    """Consume events from the bus and pass them to all handlers."""
     while True:
         event = await bus.consume()
         if event is None:
             break
-        try:
-            handler.handle(event)
-        except Exception:
-            logger.exception("Error handling event")
+        for handler in handlers:
+            try:
+                handler.handle(event)
+            except Exception:
+                logger.exception("Error handling event in %s", type(handler).__name__)

@@ -4,15 +4,18 @@ import argparse
 import asyncio
 import json
 import logging
+import os
 import signal
 import sys
 from pathlib import Path
 
 import aiohttp
+from aiohttp import web
 
 from status_tracker.events import ConsoleHandler, EventBus, run_consumer
 from status_tracker.models import PageConfig
 from status_tracker.monitor import FeedMonitor
+from status_tracker.web import WebHandler, create_web_app
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +79,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=MAX_CONCURRENT_CONNECTIONS,
         help=f"Max concurrent HTTP connections (default: {MAX_CONCURRENT_CONNECTIONS})",
     )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help="Port for web dashboard (default: PORT env var or 8080)",
+    )
+    parser.add_argument(
+        "--no-web",
+        action="store_true",
+        help="Disable web dashboard, console only",
+    )
     return parser.parse_args(argv)
 
 
@@ -112,7 +126,12 @@ def build_pages(args: argparse.Namespace) -> list[PageConfig]:
     ]
 
 
-async def run(pages: list[PageConfig] | None = None, concurrency: int = MAX_CONCURRENT_CONNECTIONS) -> None:
+async def run(
+    pages: list[PageConfig] | None = None,
+    concurrency: int = MAX_CONCURRENT_CONNECTIONS,
+    web_port: int | None = None,
+    no_web: bool = False,
+) -> None:
     """Start monitoring all configured status pages."""
     if not pages:
         logger.warning("No pages configured, exiting.")
@@ -125,7 +144,9 @@ async def run(pages: list[PageConfig] | None = None, concurrency: int = MAX_CONC
     )
 
     event_bus = EventBus()
-    handler = ConsoleHandler()
+    console_handler = ConsoleHandler()
+    web_handler = WebHandler()
+    web_handler.set_page_count(len(pages))
     semaphore = asyncio.Semaphore(concurrency)
 
     shutdown_event = asyncio.Event()
@@ -139,6 +160,17 @@ async def run(pages: list[PageConfig] | None = None, concurrency: int = MAX_CONC
         for sig in (signal.SIGINT, signal.SIGTERM):
             loop.add_signal_handler(sig, _signal_handler)
 
+    # Start web server if enabled
+    web_runner = None
+    if not no_web:
+        port = web_port or int(os.environ.get("PORT", 8080))
+        app = create_web_app(web_handler)
+        web_runner = web.AppRunner(app)
+        await web_runner.setup()
+        site = web.TCPSite(web_runner, "0.0.0.0", port)
+        await site.start()
+        logger.info("Web dashboard running at http://0.0.0.0:%d", port)
+
     connector = aiohttp.TCPConnector(
         limit=concurrency,
         limit_per_host=5,
@@ -150,11 +182,15 @@ async def run(pages: list[PageConfig] | None = None, concurrency: int = MAX_CONC
 
         # Start all monitor tasks + consumer
         monitor_tasks = [asyncio.create_task(m.run()) for m in monitors]
-        consumer_task = asyncio.create_task(run_consumer(event_bus, handler))
+        consumer_task = asyncio.create_task(
+            run_consumer(event_bus, console_handler, web_handler)
+        )
 
         print(f"Monitoring {len(pages)} status page(s): {', '.join(p.name for p in pages)}")
         print(f"Poll interval: {pages[0].poll_interval}s (max {pages[0].max_poll_interval}s)")
         print(f"Concurrency: {concurrency} connections")
+        if not no_web:
+            print(f"Web dashboard: http://localhost:{port}")
         print("Press Ctrl+C to stop.\n")
 
         # Wait for shutdown signal
@@ -176,6 +212,9 @@ async def run(pages: list[PageConfig] | None = None, concurrency: int = MAX_CONC
         await event_bus.shutdown()
         await consumer_task
 
+    if web_runner:
+        await web_runner.cleanup()
+
     logger.info("Shutdown complete")
 
 
@@ -183,7 +222,12 @@ def main() -> None:
     args = parse_args()
     pages = build_pages(args)
     try:
-        asyncio.run(run(pages=pages, concurrency=args.concurrency))
+        asyncio.run(run(
+            pages=pages,
+            concurrency=args.concurrency,
+            web_port=args.port,
+            no_web=args.no_web,
+        ))
     except KeyboardInterrupt:
         pass
 
