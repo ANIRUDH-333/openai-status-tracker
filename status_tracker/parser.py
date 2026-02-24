@@ -84,6 +84,11 @@ def parse_atom_feed(xml_bytes: bytes) -> tuple[datetime | None, list[Incident]]:
 
     Returns (feed_updated_timestamp, incidents).
     The feed_updated_timestamp can be used for short-circuit comparison.
+
+    Note: incident.io feeds use <content type="html"> with XML-escaped HTML inside.
+    ElementTree unescapes it automatically, so content_el.text returns raw HTML
+    like '<b>Status: Resolved</b>'. Discovered this when a mock server served
+    unescaped HTML and the parser got None — the tags were parsed as XML children.
     """
     root = ET.fromstring(xml_bytes)
 

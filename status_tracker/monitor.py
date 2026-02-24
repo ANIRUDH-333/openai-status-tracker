@@ -66,6 +66,8 @@ class FeedMonitor:
 
         Returns (body, was_304). body is None on error, was_304=True means unchanged.
         """
+        # Explicitly avoid Brotli — status.openai.com returns Content-Encoding: br by default,
+        # and aiohttp can't decode it without the optional `brotli` package.
         headers: dict[str, str] = {"Accept-Encoding": "gzip, deflate"}
         if self._etag:
             headers["If-None-Match"] = self._etag
@@ -155,7 +157,8 @@ class FeedMonitor:
 
             prev = self._known.get(inc.id)
             if prev is None:
-                # New to us — seed silently on first poll, emit on subsequent polls
+                # Seed silently on first poll — the feed contains ~50 historical entries
+                # going back months. Without this, startup would spam old resolved incidents.
                 self._known[inc.id] = (inc.updated, inc.status_text)
                 if not self._seeded:
                     continue

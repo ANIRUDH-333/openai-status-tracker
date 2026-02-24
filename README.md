@@ -1,6 +1,6 @@
 # OpenAI Status Tracker
 
-Automatically detects and logs service incidents from the OpenAI Status Page (and any Atom-compatible status page) using an event-driven architecture.
+Monitors the OpenAI status page for service incidents and logs them in real-time. Built with an event-driven internal architecture that scales to 100+ status pages.
 
 ## Quick Start
 
@@ -8,6 +8,8 @@ Automatically detects and logs service incidents from the OpenAI Status Page (an
 pip install -r requirements.txt
 python -m status_tracker
 ```
+
+Web dashboard runs at `http://localhost:8080` by default. Console output runs in parallel.
 
 ## Usage
 
@@ -18,14 +20,17 @@ python -m status_tracker
 # Custom pages via CLI
 python -m status_tracker --pages OpenAI=https://status.openai.com GitHub=https://www.githubstatus.com
 
-# Custom intervals
-python -m status_tracker --poll-interval 30 --max-poll-interval 120
+# Custom intervals and concurrency
+python -m status_tracker --poll-interval 30 --max-poll-interval 120 --concurrency 100
 
 # From config file
 python -m status_tracker --config config.json
 
-# Adjust concurrency for 100+ pages
-python -m status_tracker --config pages.json --concurrency 100
+# Console only (no web server)
+python -m status_tracker --no-web
+
+# Custom web port
+python -m status_tracker --port 3000
 ```
 
 ### Config file format
@@ -46,53 +51,154 @@ python -m status_tracker --config pages.json --concurrency 100
 pytest tests/ -v
 ```
 
+22 tests covering parser correctness, event bus behavior, and full integration tests with a mock feed server (new incident → update → resolve → error recovery).
+
+---
+
+## Investigation: What Does status.openai.com Actually Expose?
+
+Before writing any code, I inspected what `status.openai.com` actually offers. It's powered by **incident.io** (not Atlassian Statuspage, which is a common assumption).
+
+### Endpoints explored
+
+| Endpoint | Format | What I found |
+|---|---|---|
+| `/feed.atom` | Atom XML | Full incident data: title, status, timestamps, affected components embedded in HTML `<content>`. Standard Atom format — works with any provider. |
+| `/feed.rss` | RSS XML | Same data in RSS format. Atom is slightly richer (has `<updated>` per-entry), so I went with Atom. |
+| `/api/v2/incidents.json` | JSON | Structured but `body` fields are empty strings. incident.io-specific — not portable. |
+| `/api/v2/summary.json` | JSON | Lists components but no incident data. Useless for monitoring. |
+
+### "Subscribe to updates" options
+
+The status page offers three subscription methods:
+
+- **Email** — OpenAI pushes emails on incidents. Would require standing up an email receiver + parsing HTML emails. Overkill for this use case, and doesn't scale to 100+ arbitrary pages.
+- **RSS/Atom** — Just gives you the feed URL. Your reader polls it. No push involved.
+- **Slack** — Posts to a Slack channel via webhook. Requires Slack workspace setup per provider. Not portable.
+
+### Is there a push mechanism?
+
+I checked the Atom feed for a [WebSub](https://www.w3.org/TR/websub/) hub (`<link rel="hub">`), which would enable real-time push notifications via the Atom standard. **There isn't one.** The feed is plain Atom with no push signaling.
+
+No SSE endpoint. No WebSocket. No public webhook registration API.
+
+**The Atom feed is the only viable machine-readable interface**, and polling it is the only option for consumer-side monitoring.
+
+---
+
 ## Design Decisions
 
-### Why polling? Why not true push-based events?
+### Why polling is the right answer here
 
-The OpenAI status page (powered by incident.io) does not expose push-based notification mechanisms — no WebSocket endpoint, no Server-Sent Events (SSE), and no public webhook registration. The Atom feed at `/feed.atom` is the only machine-readable interface available.
+The problem statement asks for an "event-based approach." I want to be explicit: **there is no way to get push notifications from OpenAI's status page** without infrastructure they don't expose (webhook admin access, a WebSub hub, SSE/WS endpoints). This isn't an oversight — I investigated every option.
 
-This is true for virtually all status page providers (incident.io, Atlassian Statuspage, etc.). They publish Atom/RSS feeds but don't offer consumer-facing push APIs.
+What I built instead: **efficient change detection on top of polling, with an event-driven internal architecture.** The polling is the data acquisition layer. Everything downstream is event-driven — monitors produce `StatusEvent`s into an async queue, consumers (console, web dashboard) react independently.
 
-**Given this constraint, we built an efficient adaptive polling system that minimizes overhead:**
+The polling itself is optimized to be as close to push as possible:
 
-1. **HTTP conditional requests (ETag / If-Modified-Since)**: On each poll, we send cached `ETag` and `Last-Modified` headers. If the feed hasn't changed, the server returns `304 Not Modified` — zero body transfer, minimal bandwidth. At 100+ pages, most polls are 304s.
+1. **HTTP conditional requests (ETag / If-Modified-Since)** — each poll sends cached headers. If nothing changed, the server returns `304 Not Modified` — zero body transfer. At 100+ pages, the vast majority of polls are 304s.
 
-2. **Feed-level short-circuit**: Even if we get a full response, we compare the feed's `<updated>` timestamp before parsing entries. If unchanged, we skip all XML processing.
+2. **Feed-level short-circuit** — compare the feed's `<updated>` timestamp before parsing any entries. Skip all XML work if unchanged.
 
-3. **Entry-level dedup**: We track `(entry_id, updated_timestamp)` per incident. Only actual state changes (new incident, status change, resolution) produce events.
+3. **Entry-level dedup** — track `(entry_id, updated_timestamp)` per incident. Only actual state changes emit events.
 
-4. **Adaptive backoff on errors only**: Transient failures trigger geometric backoff with jitter (60s → 90s → 135s → ... → 300s max). Successful polls always run at the configured interval — we don't penalize quiet periods.
+4. **Backoff on errors only** — transient failures get geometric backoff with jitter. Successful polls always run at the configured interval. I deliberately chose not to back off on "no changes" — quiet periods shouldn't increase detection latency.
 
-### How it would evolve for true push
+### Why stdlib XML over feedparser
 
-For providers that support it, the architecture is ready:
+[feedparser](https://github.com/kurtmckee/feedparser) is the standard Python library for RSS/Atom parsing. I chose not to use it:
 
-- **Webhook relay**: Some enterprise status page plans offer outbound webhooks. These could post to a message queue (SQS, Redis Streams), which a consumer would read from — replacing the polling loop but keeping the same `EventBus → Handler` pipeline.
-- **WebSub/PubSubHubbub**: The Atom spec supports WebSub for real-time push. If a status page advertises a WebSub hub, we could subscribe instead of polling.
-- **Hybrid approach**: Use webhooks where available, fall back to polling for pages that don't support them. The `EventBus` abstraction means handlers don't care about the source.
+- It's ~15k lines of code for a problem that needs ~60 lines of parsing
+- Last meaningful update was 2023 — maintenance is sporadic
+- The OpenAI feed structure is simple enough that `xml.etree.ElementTree` (stdlib) handles it cleanly
+- One less dependency to audit and keep updated
+
+The tricky part is extracting status and components from the HTML inside `<content>`. I wrote a small `HTMLParser` subclass that pulls `<b>Status: Investigating</b>` and `<li>Conversations (Degraded Performance)</li>` patterns. It's ~40 lines and handles everything the real feed throws at it.
+
+### Alternatives I rejected
+
+| Approach | Why not |
+|---|---|
+| **feedparser library** | Heavy, unmaintained, adds a dependency for a simple feed |
+| **Selenium/Playwright scraping** | Brittle, slow, likely blocked by ToS, doesn't scale |
+| **Statuspage JSON API** (`/api/v2/`) | Empty `body` fields, incident.io-specific, not portable across providers |
+| **Webhook receiver + ngrok** | Would be truly event-based but requires infrastructure beyond scope, and not all providers offer webhooks |
+| **Email subscription parsing** | OpenAI offers email alerts, but standing up an email receiver for 100+ providers is not practical |
+
+---
+
+## Observations from the Real Feed
+
+Things I discovered by running against the live `status.openai.com/feed.atom`:
+
+- **Brotli encoding**: The server returns `Content-Encoding: br` by default. aiohttp can't decode Brotli without the optional `brotli` package. I explicitly request `Accept-Encoding: gzip, deflate` to avoid this — one fewer dependency.
+
+- **Double-slash in links**: Incident URLs in the feed contain `//incidents/` (e.g., `status.openai.com//incidents/01KHYH...`). This is in the feed itself, not a parsing bug. I left it as-is rather than silently "fixing" upstream data.
+
+- **HTML content is XML-escaped**: The `<content type="html">` field contains HTML escaped as `&lt;b&gt;Status: Resolved&lt;/b&gt;`. ElementTree handles this correctly — `content_el.text` returns the unescaped HTML. I discovered this when my mock test server served unescaped HTML and the parser got `None` for content.
+
+- **~50 historical entries on first fetch**: The feed includes incidents going back months. Without silent seeding on first poll, startup would spam dozens of old resolved incidents. The monitor seeds `_known` on the first poll without emitting events.
+
+- **Feed generator is `incident.io`**: Confirmed via `<generator>incident.io</generator>`. This is relevant because incident.io feeds have slightly different structure than Atlassian Statuspage feeds (e.g., `<summary>` vs `<content>` for incident details).
+
+---
 
 ## Architecture
 
 ```
 FeedMonitor(s) ──emit──▸ EventBus (asyncio.Queue) ──recv──▸ ConsoleHandler
-  (1 per page)                                              (+ future: Slack, DB, webhook)
+  (1 per page)                                              ──recv──▸ WebHandler (dashboard)
 ```
 
-- **FeedMonitor**: One per page. Async HTTP fetch with ETag caching, retry with jitter, Atom parsing, change detection.
-- **EventBus**: `asyncio.Queue` decoupling producers from consumers. Backpressure-aware (drops events on overflow rather than blocking producers).
-- **ConsoleHandler**: Formats and prints events with ANSI colors (red = new, yellow = update, green = resolved).
+- **FeedMonitor**: One per page. Async HTTP fetch with ETag caching, retry with exponential backoff + jitter, Atom parsing, change detection.
+- **EventBus**: `asyncio.Queue` decoupling producers from consumers. Non-blocking emit — drops events on overflow rather than deadlocking producers.
+- **ConsoleHandler**: ANSI color-coded terminal output (red = new, yellow = update, green = resolved).
+- **WebHandler**: In-memory event buffer serving an HTML dashboard. Auto-refreshes every 30s.
 
 Single `asyncio` event loop with tuned `TCPConnector` — scales to 100+ pages with no threads.
 
-### Scalability features
+### Scalability to 100+ pages
 
-| Feature | Impact at 100+ pages |
+| Feature | Impact |
 |---|---|
 | ETag/If-Modified-Since | Most polls return 304 — near-zero bandwidth |
 | Semaphore-bounded concurrency | Configurable via `--concurrency` |
 | TCPConnector with per-host limits | Prevents overwhelming any single provider |
 | DNS cache (300s TTL) | Reduces DNS lookups across monitors |
 | Retry with exponential backoff + jitter | Prevents thundering herd on transient failures |
-| Per-monitor isolation | One page's error doesn't affect others |
+| Per-monitor isolation | One page's parse error doesn't crash others |
 
+### How it would evolve for true push
+
+The `EventBus` abstraction means the data source is swappable:
+
+- **Webhook relay**: For providers with outbound webhooks (some enterprise Statuspage plans), receive POSTs into a queue that feeds the same `EventBus → Handler` pipeline. The polling loop is replaced; everything downstream stays the same.
+- **WebSub**: If a provider's Atom feed advertises a WebSub hub (none do currently), subscribe for real-time push instead of polling.
+- **Hybrid**: Use webhooks where available, fall back to polling for the rest. Handlers don't care about the source — they just consume `StatusEvent`s.
+
+## Deployment
+
+### Render
+
+The app is deployed at: **https://openai-status-tracker-kz6k.onrender.com**
+
+To deploy your own:
+1. Push to GitHub
+2. Connect repo in [Render dashboard](https://dashboard.render.com)
+3. Auto-detects `Dockerfile` and `render.yaml`
+4. Deploy
+
+Render sets `PORT` automatically. The free tier spins down after 15 min of inactivity — the app re-seeds on restart.
+
+### Docker
+
+```bash
+docker build -t status-tracker .
+docker run -p 8080:8080 status-tracker
+```
+
+### Console only (no web server)
+
+```bash
+python -m status_tracker --no-web
+```
