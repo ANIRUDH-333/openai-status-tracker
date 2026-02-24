@@ -48,6 +48,7 @@ python -m status_tracker --port 3000
 ## Running Tests
 
 ```bash
+pip install -r requirements-dev.txt
 pytest tests/ -v
 ```
 
@@ -177,29 +178,3 @@ The `EventBus` abstraction means the data source is swappable:
 - **WebSub**: If a provider's Atom feed advertises a WebSub hub (none do currently), subscribe for real-time push instead of polling.
 - **Hybrid**: Use webhooks where available, fall back to polling for the rest. Handlers don't care about the source — they just consume `StatusEvent`s.
 
-## Deployment
-
-### Render
-
-The app is deployed at: **https://openai-status-tracker-kz6k.onrender.com**
-
-To deploy your own:
-1. Push to GitHub
-2. Connect repo in [Render dashboard](https://dashboard.render.com)
-3. Auto-detects `Dockerfile` and `render.yaml`
-4. Deploy
-
-Render sets `PORT` automatically. The free tier spins down after 15 min of inactivity — the app re-seeds on restart.
-
-### Docker
-
-```bash
-docker build -t status-tracker .
-docker run -p 8080:8080 status-tracker
-```
-
-### Console only (no web server)
-
-```bash
-python -m status_tracker --no-web
-```
