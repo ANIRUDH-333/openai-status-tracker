@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import html
-import os
 from collections import deque
 from datetime import datetime
 from string import Template
