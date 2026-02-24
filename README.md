@@ -106,12 +106,13 @@ The polling itself is optimized to be as close to push as possible:
 
 ### Why stdlib XML over feedparser
 
-[feedparser](https://github.com/kurtmckee/feedparser) is the standard Python library for RSS/Atom parsing. I chose not to use it:
+[feedparser](https://github.com/kurtmckee/feedparser) is the standard Python library for RSS/Atom parsing — actively maintained, 2k+ stars, solid choice. I chose not to use it here because:
 
-- It's ~15k lines of code for a problem that needs ~60 lines of parsing
-- Last meaningful update was 2023 — maintenance is sporadic
-- The OpenAI feed structure is simple enough that `xml.etree.ElementTree` (stdlib) handles it cleanly
-- One less dependency to audit and keep updated
+- The feed structure I'm parsing is narrow: one provider type (incident.io), one format (Atom), with a known HTML content pattern. `xml.etree.ElementTree` (stdlib) handles this in ~60 lines.
+- The custom `HTMLParser` subclass I wrote extracts status text and affected components from the `<content>` HTML — feedparser wouldn't help with that part anyway, since the incident-specific structure is custom to incident.io.
+- Keeping it to one external dependency (`aiohttp`) means fewer things to audit and version-pin.
+
+feedparser would be the right call if I needed to handle diverse feed formats (RSS 0.9x, RSS 2.0, Atom 0.3, Atom 1.0, CDF) from unknown providers. For this use case, it's unnecessary.
 
 The tricky part is extracting status and components from the HTML inside `<content>`. I wrote a small `HTMLParser` subclass that pulls `<b>Status: Investigating</b>` and `<li>Conversations (Degraded Performance)</li>` patterns. It's ~40 lines and handles everything the real feed throws at it.
 
@@ -119,7 +120,7 @@ The tricky part is extracting status and components from the HTML inside `<conte
 
 | Approach | Why not |
 |---|---|
-| **feedparser library** | Heavy, unmaintained, adds a dependency for a simple feed |
+| **feedparser library** | Good library, but adds a dependency for a feed narrow enough that stdlib handles it. Doesn't help with the custom HTML parsing anyway. |
 | **Selenium/Playwright scraping** | Brittle, slow, likely blocked by ToS, doesn't scale |
 | **Statuspage JSON API** (`/api/v2/`) | Empty `body` fields, incident.io-specific, not portable across providers |
 | **Webhook receiver + ngrok** | Would be truly event-based but requires infrastructure beyond scope, and not all providers offer webhooks |
