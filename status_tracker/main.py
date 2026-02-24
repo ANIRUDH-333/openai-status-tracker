@@ -13,9 +13,12 @@ import aiohttp
 from aiohttp import web
 
 from status_tracker.events import ConsoleHandler, EventBus, run_consumer
-from status_tracker.models import PageConfig
+from status_tracker.models import EventType, Incident, PageConfig, StatusEvent
 from status_tracker.monitor import FeedMonitor
 from status_tracker.web import WebHandler, create_web_app
+
+# Number of recent incidents to show on dashboard at startup
+SEED_LIMIT = 5
 
 logger = logging.getLogger(__name__)
 
@@ -177,8 +180,29 @@ async def run(
         ttl_dns_cache=300,
         enable_cleanup_closed=True,
     )
+
+    def _seed_dashboard(page_name: str, incidents: list[Incident]) -> None:
+        """Push recent historical incidents to the web dashboard on first poll."""
+        if no_web:
+            return
+        # Send oldest first so newest ends up at top (appendleft in WebHandler)
+        for inc in reversed(incidents[:SEED_LIMIT]):
+            status_lower = inc.status_text.lower()
+            if status_lower in ("resolved", "postmortem"):
+                event_type = EventType.INCIDENT_RESOLVED
+            else:
+                event_type = EventType.NEW_INCIDENT
+            web_handler.handle(StatusEvent(
+                event_type=event_type,
+                page_name=page_name,
+                incident=inc,
+            ))
+
     async with aiohttp.ClientSession(connector=connector) as session:
-        monitors = [FeedMonitor(page, event_bus, session, semaphore) for page in pages]
+        monitors = [
+            FeedMonitor(page, event_bus, session, semaphore, on_seed=_seed_dashboard)
+            for page in pages
+        ]
 
         # Start all monitor tasks + consumer
         monitor_tasks = [asyncio.create_task(m.run()) for m in monitors]

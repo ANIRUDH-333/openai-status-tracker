@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+from collections.abc import Callable
 from datetime import datetime
 
 import aiohttp
@@ -27,11 +28,13 @@ class FeedMonitor:
         event_bus: EventBus,
         session: aiohttp.ClientSession,
         semaphore: asyncio.Semaphore,
+        on_seed: Callable[[str, list[Incident]], None] | None = None,
     ) -> None:
         self._config = config
         self._bus = event_bus
         self._session = session
         self._semaphore = semaphore
+        self._on_seed = on_seed
 
         # Change detection state
         self._known: dict[str, tuple[datetime, str]] = {}  # entry_id → (updated, status_text)
@@ -151,6 +154,8 @@ class FeedMonitor:
 
     async def _detect_changes(self, incidents: list[Incident]) -> None:
         """Compare incidents against known state, emit events for changes."""
+        is_first_poll = not self._seeded
+
         for inc in incidents:
             if not inc.id:
                 continue
@@ -192,6 +197,10 @@ class FeedMonitor:
                     self.events_emitted += 1
 
         self._seeded = True
+
+        # After first poll, notify callback with historical incidents for dashboard seeding
+        if is_first_poll and self._on_seed:
+            self._on_seed(self._config.name, incidents)
 
     def _backoff(self) -> None:
         self._current_interval = min(

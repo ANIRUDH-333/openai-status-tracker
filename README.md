@@ -1,5 +1,7 @@
 # OpenAI Status Tracker
 
+**[Live Demo](https://openai-status-tracker.onrender.com)** (Render free tier — may take ~30s to wake on first visit)
+
 Monitors the OpenAI status page for service incidents and logs them in real-time. Built with an event-driven internal architecture that scales to 100+ status pages.
 
 ## Quick Start
@@ -139,7 +141,7 @@ Things I discovered by running against the live `status.openai.com/feed.atom`:
 
 - **HTML content is XML-escaped**: The `<content type="html">` field contains HTML escaped as `&lt;b&gt;Status: Resolved&lt;/b&gt;`. ElementTree handles this correctly — `content_el.text` returns the unescaped HTML. I discovered this when my mock test server served unescaped HTML and the parser got `None` for content.
 
-- **~50 historical entries on first fetch**: The feed includes incidents going back months. Without silent seeding on first poll, startup would spam dozens of old resolved incidents. The monitor seeds `_known` on the first poll without emitting events.
+- **~50 historical entries on first fetch**: The feed includes incidents going back months. Without silent seeding on first poll, startup would spam dozens of old resolved incidents. The monitor seeds `_known` on the first poll without emitting console events — but the 10 most recent incidents are pushed to the web dashboard so it has content immediately instead of showing "No events yet."
 
 - **Feed generator is `incident.io`**: Confirmed via `<generator>incident.io</generator>`. This is relevant because incident.io feeds have slightly different structure than Atlassian Statuspage feeds (e.g., `<summary>` vs `<content>` for incident details).
 
